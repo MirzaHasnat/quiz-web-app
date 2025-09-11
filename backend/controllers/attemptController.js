@@ -2,6 +2,28 @@ const mongoose = require('mongoose');
 const Attempt = require('../models/Attempt');
 const Quiz = require('../models/Quiz');
 
+// Helper function to calculate remaining time for an attempt
+const calculateRemainingTime = (attempt, quiz) => {
+  if (attempt.status !== 'in-progress') {
+    return 0;
+  }
+  
+  const timeElapsed = (Date.now() - new Date(attempt.startTime)) / 1000; // seconds
+  const timingMode = attempt.timingMode || quiz.timingMode || 'total';
+  
+  if (timingMode === 'total') {
+    const totalTime = quiz.duration * 60; // seconds
+    return Math.max(0, totalTime - timeElapsed);
+  } else if (timingMode === 'per-question') {
+    const totalTime = quiz.calculateTotalQuestionTime ? 
+      quiz.calculateTotalQuestionTime() : 
+      quiz.questions.reduce((total, q) => total + (q.timeLimit || 60), 0);
+    return Math.max(0, totalTime - timeElapsed);
+  }
+  
+  return 0;
+};
+
 // @desc    Get all attempts with filtering and pagination
 // @route   GET /api/attempts
 // @access  Private/Admin
@@ -57,26 +79,35 @@ exports.getAttempts = async (req, res, next) => {
     
     // Execute query
     const attempts = await Attempt.find(query)
-      .populate('quizId', 'title')
+      .populate('quizId', 'title duration questions timingMode')
       .populate('userId', 'username')
       .populate('reviewedBy', 'username')
       .sort(sort)
       .skip(skip)
       .limit(limitNum);
     
+    // Calculate remaining time for each in-progress attempt
+    const attemptsWithTiming = attempts.map(attempt => {
+      const attemptObj = attempt.toObject();
+      if (attempt.status === 'in-progress' && attempt.quizId) {
+        attemptObj.remainingTime = calculateRemainingTime(attempt, attempt.quizId);
+      }
+      return attemptObj;
+    });
+    
     // Get total count for pagination
     const total = await Attempt.countDocuments(query);
     
     res.status(200).json({
       status: 'success',
-      count: attempts.length,
+      count: attemptsWithTiming.length,
       total,
       pagination: {
         page: pageNum,
         limit: limitNum,
         totalPages: Math.ceil(total / limitNum)
       },
-      data: attempts
+      data: attemptsWithTiming
     });
   } catch (err) {
     next(err);
@@ -116,6 +147,28 @@ exports.getAttemptDetails = async (req, res, next) => {
       });
     }
 
+    // Calculate timing information using the helper function
+    let timingInfo = {
+      timingMode: attempt.timingMode || 'total',
+      remainingTime: calculateRemainingTime(attempt, attempt.quizId),
+      totalTime: 0
+    };
+
+    // Set total time based on timing mode
+    if (attempt.timingMode === 'total') {
+      timingInfo.totalTime = attempt.quizId.duration * 60; // seconds
+    } else if (attempt.timingMode === 'per-question') {
+      timingInfo.totalTime = attempt.quizId.calculateTotalQuestionTime ? 
+        attempt.quizId.calculateTotalQuestionTime() : 
+        attempt.quizId.questions.reduce((total, q) => total + (q.timeLimit || 60), 0);
+      
+      // Add question-specific timing info
+      timingInfo.questionTimeLimits = attempt.quizId.questions.map(q => ({
+        questionId: q._id,
+        timeLimit: q.timeLimit || 60 // default fallback
+      }));
+    }
+
     // For regular users, check if they can see their score
     if (req.user.role !== 'admin') {
       const quiz = attempt.quizId;
@@ -142,19 +195,35 @@ exports.getAttemptDetails = async (req, res, next) => {
         }
       }
       
-      // Add result visibility info to the response
+      // Add result visibility info and always calculate remaining time for in-progress attempts
       attempt._doc.resultsVisible = resultsVisible;
       attempt._doc.requiresManualReview = hasManualGradingQuestions || !quiz.showResultsImmediately;
-      // if in progress then show the timeRemaining
+      
+      // Always calculate and add remaining time for in-progress attempts using helper function
       if(attempt.status === 'in-progress') {
-        const timeElapsed = (Date.now() - attempt.startTime) / (1000 * 60); // minutes
-        attempt._doc.remainingTime = Math.max(0, quiz.duration - timeElapsed) * 60;
+        const calculatedRemainingTime = calculateRemainingTime(attempt, attempt.quizId);
+        attempt._doc.remainingTime = calculatedRemainingTime;
+        // Also ensure timing info has the same value
+        timingInfo.remainingTime = calculatedRemainingTime;
+        console.log(`[Backend] Calculated remaining time for attempt ${attempt._id}: ${calculatedRemainingTime}s`);
       }
+    }
+    
+    // Always calculate and add remaining time for in-progress attempts (for both admin and regular users)
+    if(attempt.status === 'in-progress') {
+      const calculatedRemainingTime = calculateRemainingTime(attempt, attempt.quizId);
+      attempt._doc.remainingTime = calculatedRemainingTime;
+      // Also ensure timing info has the same value
+      timingInfo.remainingTime = calculatedRemainingTime;
+      console.log(`[Backend] Calculated remaining time for attempt ${attempt._id}: ${calculatedRemainingTime}s`);
     }
 
     res.status(200).json({
       status: 'success',
-      data: attempt
+      data: {
+        attempt,
+        timing: timingInfo
+      }
     });
   } catch (err) {
     next(err);

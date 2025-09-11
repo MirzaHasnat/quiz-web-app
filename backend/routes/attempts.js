@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect, authorize } = require('../middleware/auth');
 const attemptController = require('../controllers/attemptController');
 const resultVisibilityController = require('../controllers/resultVisibilityController');
+const QuizTimingValidator = require('../services/quizTimingValidator');
 const Attempt = require('../models/Attempt');
 const Quiz = require('../models/Quiz');
 
@@ -49,31 +50,50 @@ router.get('/check/:quizId', async (req, res, next) => {
     let canResume = false;
     let attemptStatus = null;
     let attemptId = null;
+    let remainingTime = 0; // Initialize remainingTime at function scope
 
     if (existingAttempt) {
       attemptId = existingAttempt._id;
       attemptStatus = existingAttempt.status;
       
       if (existingAttempt.status === 'in-progress') {
-        // Check if time has expired
-        const timeElapsed = (Date.now() - existingAttempt.startTime) / (1000 * 60); // minutes
-        if (timeElapsed >= quiz.duration) {
+        // Calculate remaining time based on timing mode
+        let timeExpired = false;
+        
+        if (quiz.timingMode === 'total') {
+          const timeElapsed = (Date.now() - existingAttempt.startTime) / (1000 * 60); // minutes
+          remainingTime = Math.max(0, quiz.duration - timeElapsed);
+          timeExpired = timeElapsed >= quiz.duration;
+        } else if (quiz.timingMode === 'per-question') {
+          // For per-question mode, calculate total time from all questions
+          const totalQuestionTime = quiz.calculateTotalQuestionTime(); // seconds
+          const timeElapsed = (Date.now() - existingAttempt.startTime) / 1000; // seconds
+          remainingTime = Math.max(0, totalQuestionTime - timeElapsed);
+          timeExpired = timeElapsed >= totalQuestionTime;
+        }
+        
+        if (timeExpired) {
           // Time expired, mark as expired but don't allow new attempt
           existingAttempt.status = 'expired';
-          existingAttempt.endTime = new Date(existingAttempt.startTime.getTime() + (quiz.duration * 60 * 1000));
+          const totalTime = quiz.timingMode === 'total' ? quiz.duration * 60 * 1000 : quiz.calculateTotalQuestionTime() * 1000;
+          existingAttempt.endTime = new Date(existingAttempt.startTime.getTime() + totalTime);
           await existingAttempt.save();
           canStart = false;
           canResume = false;
           attemptStatus = 'expired';
+          remainingTime = 0;
         } else {
           // Can resume
           canStart = false;
           canResume = true;
+          // Convert remaining time to seconds for consistency
+          remainingTime = quiz.timingMode === 'total' ? remainingTime * 60 : remainingTime;
         }
       } else if (existingAttempt.status === 'submitted' || existingAttempt.status === 'reviewed' || existingAttempt.status === 'time_up') {
         // Already completed
         canStart = false;
         canResume = false;
+        remainingTime = 0; // Set to 0 for completed attempts
       }
     }
 
@@ -84,12 +104,13 @@ router.get('/check/:quizId', async (req, res, next) => {
         canResume,
         attemptStatus,
         attemptId,
-        remainingTime: canResume ? Math.max(0, quiz.duration - Math.floor((Date.now() - existingAttempt.startTime) / (1000 * 60))) : null,
+        remainingTime: canResume ? remainingTime : null,
         quiz: {
           id: quiz._id,
           title: quiz.title,
           duration: quiz.duration,
-
+          timingMode: quiz.timingMode || 'total',
+          totalTime: quiz.calculateTotalQuestionTime()
         }
       }
     });
@@ -142,7 +163,8 @@ router.post('/start/:quizId', async (req, res, next) => {
     const attempt = await Attempt.create({
       quizId: quiz._id,
       userId: req.user._id,
-      maxScore: quiz.calculateMaxScore()
+      maxScore: quiz.calculateMaxScore(),
+      timingMode: quiz.timingMode || 'total'
     });
 
     res.status(201).json({
@@ -173,12 +195,28 @@ router.get('/resume/:attemptId', async (req, res, next) => {
       });
     }
 
-    // Check if time has expired
-    const timeElapsed = (Date.now() - attempt.startTime) / (1000 * 60); // minutes
-    if (timeElapsed >= attempt.quizId.duration) {
+    // Check if time has expired based on timing mode
+    let timeExpired = false;
+    let remainingTime = 0;
+    
+    if (attempt.quizId.timingMode === 'total') {
+      const timeElapsed = (Date.now() - attempt.startTime) / (1000 * 60); // minutes
+      remainingTime = Math.max(0, (attempt.quizId.duration * 60) - (timeElapsed * 60)); // seconds
+      timeExpired = timeElapsed >= attempt.quizId.duration;
+    } else if (attempt.quizId.timingMode === 'per-question') {
+      const totalQuestionTime = attempt.quizId.calculateTotalQuestionTime(); // seconds
+      const timeElapsed = (Date.now() - attempt.startTime) / 1000; // seconds
+      remainingTime = Math.max(0, totalQuestionTime - timeElapsed);
+      timeExpired = timeElapsed >= totalQuestionTime;
+    }
+    
+    if (timeExpired) {
       // Time expired, mark as expired
       attempt.status = 'expired';
-      attempt.endTime = new Date(attempt.startTime.getTime() + (attempt.quizId.duration * 60 * 1000));
+      const totalTime = attempt.quizId.timingMode === 'total' 
+        ? attempt.quizId.duration * 60 * 1000 
+        : attempt.quizId.calculateTotalQuestionTime() * 1000;
+      attempt.endTime = new Date(attempt.startTime.getTime() + totalTime);
       await attempt.save();
       
       return res.status(400).json({
@@ -189,19 +227,22 @@ router.get('/resume/:attemptId', async (req, res, next) => {
     }
 
     // Calculate remaining time
-    const remainingTime = (attempt.quizId.duration * 60) - (timeElapsed * 60); // seconds
+    const remainingTimeSeconds = Math.floor(remainingTime);
 
     res.status(200).json({
       status: 'success',
       data: {
         attempt,
-        remainingTime: Math.max(0, Math.floor(remainingTime))
+        remainingTime: Math.max(0, remainingTimeSeconds),
+        timingMode: attempt.quizId.timingMode || 'total'
       }
     });
   } catch (err) {
     next(err);
   }
 });
+
+
 
 // @route   PUT /api/attempts/save/:attemptId
 // @desc    Save answers during quiz (auto-save)
@@ -218,12 +259,18 @@ router.put('/save/:attemptId', async (req, res, next) => {
       });
     }
 
-    // Find attempt
-    const attempt = await Attempt.findOne({
+    // Find attempt - Allow admin to access any attempt
+    let query = {
       _id: req.params.attemptId,
-      userId: req.user._id,
       status: 'in-progress'
-    });
+    };
+    
+    // If not admin, restrict to user's own attempts
+    if (req.user.role !== 'admin') {
+      query.userId = req.user._id;
+    }
+    
+    const attempt = await Attempt.findOne(query);
 
     if (!attempt) {
       return res.status(404).json({
@@ -272,13 +319,19 @@ router.put('/submit/:quizId/:attemptId', async (req, res, next) => {
       });
     }
 
-    // Find attempt
-    const attempt = await Attempt.findOne({
+    // Find attempt - Allow admin to access any attempt
+    let query = {
       _id: req.params.attemptId,
       quizId: req.params.quizId,
-      userId: req.user._id,
       status: 'in-progress'
-    }).populate('recordings');
+    };
+    
+    // If not admin, restrict to user's own attempts
+    if (req.user.role !== 'admin') {
+      query.userId = req.user._id;
+    }
+    
+    const attempt = await Attempt.findOne(query).populate('recordings');
 
     if (!attempt) {
       return res.status(404).json({
@@ -431,8 +484,8 @@ router.get('/stats', authorize('admin'), attemptController.getAttemptStats);
 router.get('/pending-review', authorize('admin'), resultVisibilityController.getPendingReviews);
 
 // @route   GET /api/attempts/:id
-// @desc    Get attempt details with full quiz data
-// @access  Private
+// @desc    Get attempt details with full quiz data  
+// @access  Private (Admin can access any attempt, users can only access their own)
 router.get('/:id', attemptController.getAttemptDetails);
 
 // @route   POST /api/attempts/validate/:quizId/:attemptId
@@ -450,13 +503,19 @@ router.post('/validate/:quizId/:attemptId', async (req, res, next) => {
       });
     }
 
-    // Find attempt
-    const attempt = await Attempt.findOne({
+    // Find attempt - Allow admin to access any attempt
+    let query = {
       _id: req.params.attemptId,
       quizId: req.params.quizId,
-      userId: req.user._id,
       status: 'in-progress'
-    });
+    };
+    
+    // If not admin, restrict to user's own attempts
+    if (req.user.role !== 'admin') {
+      query.userId = req.user._id;
+    }
+    
+    const attempt = await Attempt.findOne(query);
 
     if (!attempt) {
       return res.status(404).json({
@@ -620,11 +679,15 @@ router.post('/:id/activities', async (req, res, next) => {
       });
     }
 
-    // Find the attempt and verify ownership
-    const attempt = await Attempt.findOne({
-      _id: attemptId,
-      userId: req.user._id
-    });
+    // Find the attempt and verify ownership - Allow admin to access any attempt
+    let query = { _id: attemptId };
+    
+    // If not admin, restrict to user's own attempts
+    if (req.user.role !== 'admin') {
+      query.userId = req.user._id;
+    }
+    
+    const attempt = await Attempt.findOne(query);
 
     if (!attempt) {
       return res.status(404).json({

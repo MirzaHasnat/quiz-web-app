@@ -98,7 +98,8 @@ const AttemptReviewDetail = () => {
       setError(null);
       
       const response = await getAttemptDetails(attemptId);
-      const attemptData = response.data;
+      // Handle new response structure: response.data contains {attempt, timing}
+      const attemptData = response.data.attempt || response.data;
       
       setAttempt(attemptData);
       
@@ -107,16 +108,19 @@ const AttemptReviewDetail = () => {
       const initialScores = {};
       const initialNegativeScores = {};
       
-      attemptData.answers.forEach(answer => {
-        initialFeedback[answer._id] = answer.feedback || '';
-        initialScores[answer._id] = answer.score || 0;
-        initialNegativeScores[answer._id] = answer.negativeScore || 0;
-      });
+      // Check if answers exist before calling forEach
+      if (attemptData.answers && Array.isArray(attemptData.answers)) {
+        attemptData.answers.forEach(answer => {
+          initialFeedback[answer._id] = answer.feedback || '';
+          initialScores[answer._id] = answer.score || 0;
+          initialNegativeScores[answer._id] = answer.negativeScore || 0;
+        });
+      }
       
       setFeedback(initialFeedback);
       setScores(initialScores);
       setNegativeScores(initialNegativeScores);
-      setTotalScore(attemptData.totalScore);
+      setTotalScore(attemptData.totalScore || 0);
       
       setLoading(false);
     } catch (err) {
@@ -170,7 +174,7 @@ const AttemptReviewDetail = () => {
   };
 
   const getMaxPointsForQuestion = (answerId) => {
-    if (!attempt || !attempt.quizId || !attempt.quizId.questions) return 0;
+    if (!attempt || !attempt.quizId || !attempt.quizId.questions || !attempt.answers) return 0;
     
     const answer = attempt.answers.find(a => a._id === answerId);
     if (!answer) return 0;
@@ -214,12 +218,12 @@ const AttemptReviewDetail = () => {
       setSaving(true);
       
       // Prepare answers data with updated scores and feedback
-      const answers = attempt.answers.map(answer => ({
+      const answers = (attempt.answers || []).map(answer => ({
         _id: answer._id,
-        score: scores[answer._id],
+        score: scores[answer._id] || 0,
         negativeScore: negativeScores[answer._id] || 0,
-        feedback: feedback[answer._id],
-        isCorrect: scores[answer._id] > 0
+        feedback: feedback[answer._id] || '',
+        isCorrect: (scores[answer._id] || 0) > 0
       }));
       
       // First save all the answer scores and feedback
@@ -533,7 +537,7 @@ const AttemptReviewDetail = () => {
       
       {tabValue === 0 && (
         <Box>
-          {attempt.answers.map((answer, index) => {
+          {attempt.answers && Array.isArray(attempt.answers) && attempt.answers.map((answer, index) => {
             const question = attempt.quizId?.questions?.find(q => q._id === answer.questionId);
             const maxPoints = question ? question.points : 0;
             
@@ -618,6 +622,12 @@ const AttemptReviewDetail = () => {
               </Card>
             );
           })}
+          
+          {(!attempt.answers || !Array.isArray(attempt.answers) || attempt.answers.length === 0) && (
+            <Alert severity="info" sx={{ mt: 2 }}>
+              No answers found for this attempt.
+            </Alert>
+          )}
         </Box>
       )}
       

@@ -4,6 +4,7 @@ const { check } = require('express-validator');
 const { protect, authorize } = require('../middleware/auth');
 const validate = require('../middleware/validate');
 const Quiz = require('../models/Quiz');
+const QuizTimingValidator = require('../services/quizTimingValidator');
 const resultVisibilityController = require('../controllers/resultVisibilityController');
 
 // All routes in this file require authentication
@@ -83,7 +84,12 @@ router.post('/', [
   authorize('admin'),
   check('title').notEmpty().withMessage('Title is required'),
   check('description').notEmpty().withMessage('Description is required'),
-  check('duration').isNumeric().withMessage('Duration must be a number'),
+  check('timingMode').optional().isIn(['total', 'per-question'])
+    .withMessage('Timing mode must be either "total" or "per-question"'),
+  check('duration').optional().isNumeric().withMessage('Duration must be a number'),
+  check('questions').optional().isArray().withMessage('Questions must be an array'),
+  check('questions.*.timeLimit').optional().isNumeric()
+    .withMessage('Question time limit must be a number'),
   check('recordingSettings.enableMicrophone').optional().isBoolean()
     .withMessage('enableMicrophone must be a boolean'),
   check('recordingSettings.enableCamera').optional().isBoolean()
@@ -97,6 +103,17 @@ router.post('/', [
   validate
 ], async (req, res, next) => {
   try {
+    // Validate timing configuration
+    const timingValidation = QuizTimingValidator.validateQuizTiming(req.body);
+    if (!timingValidation.isValid) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'INVALID_TIMING_CONFIGURATION',
+        message: 'Invalid timing configuration',
+        errors: timingValidation.errors
+      });
+    }
+    
     // Add user to request body
     req.body.createdBy = req.user._id;
     
@@ -171,7 +188,12 @@ router.put('/:id', [
   authorize('admin'),
   check('title').optional().notEmpty().withMessage('Title is required'),
   check('description').optional().notEmpty().withMessage('Description is required'),
+  check('timingMode').optional().isIn(['total', 'per-question'])
+    .withMessage('Timing mode must be either "total" or "per-question"'),
   check('duration').optional().isNumeric().withMessage('Duration must be a number'),
+  check('questions').optional().isArray().withMessage('Questions must be an array'),
+  check('questions.*.timeLimit').optional().isNumeric()
+    .withMessage('Question time limit must be a number'),
   check('recordingSettings.enableMicrophone').optional().isBoolean()
     .withMessage('enableMicrophone must be a boolean'),
   check('recordingSettings.enableCamera').optional().isBoolean()
@@ -192,6 +214,41 @@ router.put('/:id', [
         status: 'error',
         code: 'QUIZ_NOT_FOUND',
         message: 'Quiz not found'
+      });
+    }
+
+    // Validate timing mode change if provided
+    if (req.body.timingMode && req.body.timingMode !== quiz.timingMode) {
+      const timingModeValidation = QuizTimingValidator.validateTimingModeChange(
+        quiz.timingMode,
+        req.body.timingMode,
+        req.body.questions || quiz.questions
+      );
+      
+      if (!timingModeValidation.isValid) {
+        return res.status(400).json({
+          status: 'error',
+          code: 'INVALID_TIMING_MODE_CHANGE',
+          message: 'Invalid timing mode change',
+          errors: timingModeValidation.errors
+        });
+      }
+      
+      // Add warnings to response if any
+      if (timingModeValidation.warnings.length > 0) {
+        req.timingWarnings = timingModeValidation.warnings;
+      }
+    }
+
+    // Validate complete timing configuration
+    const mergedData = { ...quiz.toObject(), ...req.body };
+    const timingValidation = QuizTimingValidator.validateQuizTiming(mergedData);
+    if (!timingValidation.isValid) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'INVALID_TIMING_CONFIGURATION',
+        message: 'Invalid timing configuration',
+        errors: timingValidation.errors
       });
     }
 
@@ -266,6 +323,11 @@ router.put('/:id', [
         attemptsProcessed: attempts.length,
         attemptsUpdated: updatedCount
       };
+    }
+
+    // Add timing warnings to response if any
+    if (req.timingWarnings) {
+      quiz._doc.timingWarnings = req.timingWarnings;
     }
 
     res.status(200).json({
@@ -411,6 +473,8 @@ router.post('/:id/questions', [
     .withMessage('Question type must be single-select, multi-select, or free-text'),
   check('text').notEmpty().withMessage('Question text is required'),
   check('points').isNumeric().withMessage('Points must be a number'),
+  check('timeLimit').optional().isInt({ min: 10, max: 3600 })
+    .withMessage('Time limit must be between 10 and 3600 seconds'),
   check('options').custom((options, { req }) => {
     // Options are required for single-select and multi-select questions
     if (['single-select', 'multi-select'].includes(req.body.type)) {
@@ -455,12 +519,28 @@ router.post('/:id/questions', [
       });
     }
 
+    // Validate question timing based on quiz timing mode
+    const questionTimingValidation = QuizTimingValidator.validateQuestionTiming(
+      req.body,
+      quiz.timingMode
+    );
+    
+    if (!questionTimingValidation.isValid) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'INVALID_QUESTION_TIMING',
+        message: 'Invalid question timing configuration',
+        errors: questionTimingValidation.errors
+      });
+    }
+
     // Create the new question
     const newQuestion = {
       type: req.body.type,
       text: req.body.text,
       points: req.body.points || 1,
-      options: req.body.options || []
+      options: req.body.options || [],
+      timeLimit: req.body.timeLimit || null
     };
 
     // For free-text questions, store correctAnswer if provided
@@ -490,6 +570,8 @@ router.put('/:id/questions/:qid', [
     .withMessage('Question type must be single-select, multi-select, or free-text'),
   check('text').optional().notEmpty().withMessage('Question text is required'),
   check('points').optional().isNumeric().withMessage('Points must be a number'),
+  check('timeLimit').optional().isInt({ min: 10, max: 3600 })
+    .withMessage('Time limit must be between 10 and 3600 seconds'),
   check('options').optional().custom((options, { req }) => {
     // If type is being updated or options are being updated for a multiple choice question
     if (req.body.type && ['single-select', 'multi-select'].includes(req.body.type) || 
@@ -549,12 +631,30 @@ router.put('/:id/questions/:qid', [
       });
     }
 
+    // Validate question timing based on quiz timing mode if timeLimit is being updated
+    if (req.body.timeLimit !== undefined) {
+      const questionTimingValidation = QuizTimingValidator.validateQuestionTiming(
+        { ...question.toObject(), ...req.body },
+        quiz.timingMode
+      );
+      
+      if (!questionTimingValidation.isValid) {
+        return res.status(400).json({
+          status: 'error',
+          code: 'INVALID_QUESTION_TIMING',
+          message: 'Invalid question timing configuration',
+          errors: questionTimingValidation.errors
+        });
+      }
+    }
+
     // Update question fields
     if (req.body.type) question.type = req.body.type;
     if (req.body.text) question.text = req.body.text;
     if (req.body.points !== undefined) question.points = req.body.points;
     if (req.body.options) question.options = req.body.options;
     if (req.body.correctAnswer !== undefined) question.correctAnswer = req.body.correctAnswer;
+    if (req.body.timeLimit !== undefined) question.timeLimit = req.body.timeLimit;
 
     await quiz.save();
 
@@ -754,6 +854,88 @@ router.get('/:id/negative-marking', async (req, res, next) => {
         quizId: quiz._id,
         quizTitle: quiz.title,
         negativeMarkingSettings
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// @route   GET /api/quizzes/:id/timing-settings
+// @desc    Get timing settings for a specific quiz
+// @access  Private
+router.get('/:id/timing-settings', async (req, res, next) => {
+  try {
+    const quiz = await Quiz.findById(req.params.id).select('timingMode duration questions.timeLimit title');
+    
+    if (!quiz) {
+      return res.status(404).json({
+        status: 'error',
+        code: 'QUIZ_NOT_FOUND',
+        message: 'Quiz not found'
+      });
+    }
+
+    // Check if user has access to this quiz (for non-admin users)
+    if (req.user.role !== 'admin') {
+      const fullQuiz = await Quiz.findById(req.params.id);
+      if (!fullQuiz.activatedUsers.includes(req.user._id) || !fullQuiz.isActive) {
+        return res.status(403).json({
+          status: 'error',
+          code: 'QUIZ_ACCESS_DENIED',
+          message: 'You do not have access to this quiz'
+        });
+      }
+    }
+
+    // Return timing settings
+    const timingSettings = {
+      timingMode: quiz.timingMode || 'total',
+      duration: quiz.duration,
+      totalTime: quiz.calculateTotalQuestionTime(),
+      questionTimeLimits: quiz.timingMode === 'per-question' 
+        ? quiz.questions.map(q => ({ questionId: q._id, timeLimit: q.timeLimit }))
+        : null
+    };
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        quizId: quiz._id,
+        quizTitle: quiz.title,
+        timingSettings
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// @route   GET /api/quizzes/timing/recommendations
+// @desc    Get timing recommendations for question types
+// @access  Private/Admin
+router.get('/timing/recommendations', authorize('admin'), async (req, res, next) => {
+  try {
+    const { questionType } = req.query;
+    
+    if (!questionType) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'MISSING_QUESTION_TYPE',
+        message: 'Question type is required'
+      });
+    }
+    
+    const recommendations = QuizTimingValidator.getRecommendedTimeLimits(questionType);
+    
+    res.status(200).json({
+      status: 'success',
+      data: {
+        questionType,
+        recommendations: recommendations.map(time => ({
+          seconds: time,
+          display: `${Math.floor(time / 60)}:${(time % 60).toString().padStart(2, '0')}`
+        }))
       }
     });
   } catch (err) {

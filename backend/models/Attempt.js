@@ -49,6 +49,24 @@ const AttemptSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
+  timingMode: {
+    type: String,
+    enum: ['total', 'per-question'],
+    default: 'total'
+  },
+  questionStartTimes: {
+    type: Map,
+    of: Date,
+    default: () => new Map() // Map of questionId -> start time for per-question mode
+  },
+  questionTimeRemaining: {
+    type: Map,
+    of: Number,
+    default: () => new Map() // Map of questionId -> remaining time for per-question mode
+  },
+  timedOutQuestions: [{
+    type: mongoose.Schema.Types.ObjectId
+  }], // Questions that timed out in per-question mode
   status: {
     type: String,
     enum: ['in-progress', 'submitted', 'reviewed', 'time_up', 'expired'],
@@ -119,6 +137,36 @@ AttemptSchema.methods.getScoreBreakdown = function() {
     maxScore: this.maxScore,
     negativeMarkingApplied: this.negativeMarkingApplied
   };
+};
+
+// Calculate remaining time for current question in per-question mode
+AttemptSchema.methods.getQuestionRemainingTime = function(questionId, questionTimeLimit) {
+  if (this.timingMode !== 'per-question') return null;
+  
+  const startTime = this.questionStartTimes.get(questionId.toString());
+  if (!startTime) return questionTimeLimit;
+  
+  const elapsed = Math.floor((Date.now() - startTime.getTime()) / 1000);
+  return Math.max(0, questionTimeLimit - elapsed);
+};
+
+// Start timing for a question in per-question mode
+AttemptSchema.methods.startQuestionTimer = function(questionId) {
+  if (this.timingMode === 'per-question') {
+    this.questionStartTimes.set(questionId.toString(), new Date());
+  }
+};
+
+// Check if a question has timed out
+AttemptSchema.methods.isQuestionTimedOut = function(questionId) {
+  return this.timedOutQuestions.includes(questionId);
+};
+
+// Mark a question as timed out
+AttemptSchema.methods.markQuestionTimedOut = function(questionId) {
+  if (!this.timedOutQuestions.includes(questionId)) {
+    this.timedOutQuestions.push(questionId);
+  }
 };
 
 module.exports = mongoose.model('Attempt', AttemptSchema);

@@ -13,7 +13,12 @@ import {
   FormControlLabel,
   Grid,
   Typography,
-  Divider
+  Divider,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  FormHelperText
 } from '@mui/material';
 import axios from '../../utils/axiosConfig';
 
@@ -42,7 +47,7 @@ const QuizFormDialog = ({ open, quiz, onClose }) => {
   const [formData, setFormData] = useState({
     title: '',
     description: '',
-    durationBy: 'Quiz',
+    timingMode: 'total', // 'total' | 'per-question'
     duration: 30,
     isActive: false,
     showResultsImmediately: false,
@@ -75,7 +80,7 @@ const QuizFormDialog = ({ open, quiz, onClose }) => {
         setFormData({
           title: quiz.title || '',
           description: quiz.description || '',
-          durationBy: quiz.durationBy || 'quiz',
+          timingMode: quiz.timingMode || 'total',
           duration: quiz.duration || 30,
           isActive: quiz.isActive || false,
           showResultsImmediately: quiz.showResultsImmediately || false,
@@ -100,7 +105,7 @@ const QuizFormDialog = ({ open, quiz, onClose }) => {
         setFormData({
           title: '',
           description: '',
-          durationBy: 'quiz',
+          timingMode: 'total',
           duration: 30,
           isActive: false,
           showResultsImmediately: false,
@@ -191,11 +196,11 @@ const QuizFormDialog = ({ open, quiz, onClose }) => {
     }
     
     if (!formData.duration) {
-      newErrors.duration = 'Duration is required';
+      newErrors.duration = 'Duration is required for total timing mode';
     } else if (isNaN(formData.duration) || formData.duration <= 0) {
       newErrors.duration = 'Duration must be a positive number';
-    } else if (formData.duration > 180) {
-      newErrors.duration = 'Duration cannot exceed 180 minutes (3 hours)';
+    } else if (formData.duration > 300) {
+      newErrors.duration = 'Duration cannot exceed 300 minutes (5 hours)';
     }
     
     // Validate negative marking penalty value
@@ -227,7 +232,8 @@ const QuizFormDialog = ({ open, quiz, onClose }) => {
       const quizData = {
         title: formData.title,
         description: formData.description,
-        duration: Number(formData.duration),
+        timingMode: formData.timingMode,
+        duration: formData.timingMode === 'total' ? Number(formData.duration) : undefined,
         isActive: formData.isActive,
         showResultsImmediately: formData.showResultsImmediately,
         recordingSettings: formData.recordingSettings,
@@ -320,22 +326,64 @@ const QuizFormDialog = ({ open, quiz, onClose }) => {
               />
             </Grid>
             
-            <Grid item xs={12} md={4}>
-              <TextField
-                margin="dense"
-                label="Duration (minutes)"
-                name="duration"
-                type="number"
-                fullWidth
-                variant="outlined"
-                value={formData.duration}
-                onChange={handleChange}
-                error={Boolean(errors.duration)}
-                helperText={errors.duration}
-                disabled={loading}
-                inputProps={{ min: 1, max: 180 }}
-              />
+            <Grid item xs={12}>
+              <Divider sx={{ my: 2 }} />
+              <Typography variant="subtitle1" gutterBottom>
+                Timing Settings
+              </Typography>
             </Grid>
+            
+            <Grid item xs={12} md={6}>
+              <FormControl fullWidth variant="outlined">
+                <InputLabel>Timing Mode</InputLabel>
+                <Select
+                  value={formData.timingMode}
+                  onChange={handleChange}
+                  label="Timing Mode"
+                  name="timingMode"
+                  disabled={loading}
+                >
+                  <MenuItem value="total">Total Quiz Duration</MenuItem>
+                  <MenuItem value="per-question">Per Question Duration</MenuItem>
+                </Select>
+                <FormHelperText>
+                  {formData.timingMode === 'total' 
+                    ? 'Single timer for the entire quiz' 
+                    : 'Individual timers for each question'
+                  }
+                </FormHelperText>
+              </FormControl>
+            </Grid>
+            
+            {formData.timingMode === 'total' && (
+              <Grid item xs={12} md={6}>
+                <TextField
+                  margin="dense"
+                  label="Quiz Duration (minutes)"
+                  name="duration"
+                  type="number"
+                  fullWidth
+                  variant="outlined"
+                  value={formData.duration}
+                  onChange={handleChange}
+                  error={Boolean(errors.duration)}
+                  helperText={errors.duration || 'Total time allowed for the entire quiz'}
+                  disabled={loading}
+                  inputProps={{ min: 1, max: 300 }}
+                />
+              </Grid>
+            )}
+            
+            {formData.timingMode === 'per-question' && (
+              <Grid item xs={12}>
+                <Alert severity="info" sx={{ mt: 1 }}>
+                  <Typography variant="body2">
+                    <strong>Per-Question Timing:</strong> You'll set individual time limits for each question when managing questions. 
+                    This mode provides more granular control over time allocation.
+                  </Typography>
+                </Alert>
+              </Grid>
+            )}
             
             <Grid item xs={12}>
               <Divider sx={{ my: 2 }} />

@@ -225,6 +225,7 @@ const QuestionManagement = ({ quiz, onBack }) => {
         const questionData = {
           type: question.type,
           text: question.text,
+          timeLimit: question.timeLimit,
           points: question.points,
           options: question.options
         };
@@ -445,6 +446,7 @@ const QuestionManagement = ({ quiz, onBack }) => {
                                   onDelete={handleDeleteQuestion}
                                   onDuplicate={handleDuplicateQuestion}
                                   index={index}
+                                  quizTimingMode={quiz?.timingMode || 'total'}
                                 />
                               </Box>
                             </Box>

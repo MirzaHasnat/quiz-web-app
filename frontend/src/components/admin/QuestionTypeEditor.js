@@ -22,7 +22,8 @@ import {
   Tooltip,
   Card,
   CardContent,
-  CardActions
+  CardActions,
+  Chip
 } from '@mui/material';
 import {
   Add as AddIcon,
@@ -30,14 +31,17 @@ import {
   ContentCopy as DuplicateIcon,
   DragIndicator as DragIcon,
   ArrowUpward as ArrowUpIcon,
-  ArrowDownward as ArrowDownIcon
+  ArrowDownward as ArrowDownIcon,
+  AccessTime as TimeIcon
 } from '@mui/icons-material';
+import TimingService from '../../services/timingService';
 
-const QuestionTypeEditor = ({ question, onChange, onDelete, onDuplicate, index }) => {
+const QuestionTypeEditor = ({ question, onChange, onDelete, onDuplicate, index, quizTimingMode }) => {
   const [questionData, setQuestionData] = useState({
     type: 'single-select',
     text: '',
     points: 1,
+    timeLimit: 60, // Default time limit in seconds
     options: [
       { text: '', isCorrect: true },
       { text: '', isCorrect: false }
@@ -64,6 +68,7 @@ const QuestionTypeEditor = ({ question, onChange, onDelete, onDuplicate, index }
         type: question.type || 'single-select',
         text: question.text || '',
         points: question.points || 1,
+        timeLimit: question.timeLimit || 60,
         options: processedOptions,
         correctAnswer: question.correctAnswer || ''
       });
@@ -126,6 +131,30 @@ const QuestionTypeEditor = ({ question, onChange, onDelete, onDuplicate, index }
     
     setQuestionData(updatedQuestion);
     onChange(updatedQuestion, index);
+  };
+
+  // Handle time limit change
+  const handleTimeLimitChange = (e) => {
+    const timeLimit = Math.max(10, parseInt(e.target.value) || 60);
+    
+    const updatedQuestion = {
+      ...questionData,
+      timeLimit
+    };
+    
+    setQuestionData(updatedQuestion);
+    onChange(updatedQuestion, index);
+  };
+
+  // Get recommended time limits based on question type
+  const getRecommendedTimeLimits = (type) => {
+    const recommendations = TimingService.getDefaultRecommendations(type);
+    return recommendations.map(rec => rec.seconds);
+  };
+
+  // Get quick time limit buttons
+  const getQuickTimeLimitButtons = (type) => {
+    return TimingService.getDefaultRecommendations(type);
   };
 
   // Handle option text change
@@ -336,6 +365,50 @@ const QuestionTypeEditor = ({ question, onChange, onDelete, onDuplicate, index }
                   inputProps={{ min: 1 }}
                 />
               </Grid>
+              
+              {quizTimingMode === 'per-question' && (
+                <Grid item xs={12}>
+                  <Box>
+                    <TextField
+                      fullWidth
+                      label="Time Limit (seconds)"
+                      variant="outlined"
+                      type="number"
+                      value={questionData.timeLimit}
+                      onChange={handleTimeLimitChange}
+                      inputProps={{ min: 10, max: 3600 }}
+                      helperText={`Recommended for ${questionData.type}: ${getRecommendedTimeLimits(questionData.type).join('s, ')}s`}
+                      InputProps={{
+                        startAdornment: <TimeIcon color="action" sx={{ mr: 1 }} />
+                      }}
+                    />
+                    
+                    <Box sx={{ mt: 1, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                      <Typography variant="caption" color="text.secondary" sx={{ mr: 1, alignSelf: 'center' }}>
+                        Quick set:
+                      </Typography>
+                      {getQuickTimeLimitButtons(questionData.type).map((option) => (
+                        <Chip
+                          key={option.seconds}
+                          label={option.display}
+                          variant={questionData.timeLimit === option.seconds ? 'filled' : 'outlined'}
+                          size="small"
+                          clickable
+                          onClick={() => {
+                            const updatedQuestion = {
+                              ...questionData,
+                              timeLimit: option.seconds
+                            };
+                            setQuestionData(updatedQuestion);
+                            onChange(updatedQuestion, index);
+                          }}
+                          color={questionData.timeLimit === option.seconds ? 'primary' : 'default'}
+                        />
+                      ))}
+                    </Box>
+                  </Box>
+                </Grid>
+              )}
             </Grid>
           </Grid>
         </Grid>

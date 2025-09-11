@@ -19,6 +19,8 @@ import RecordingErrorHandler from '../components/RecordingErrorHandler';
 import RecordingMonitor from '../components/RecordingMonitor';
 import QuestionFactory from '../components/questions/QuestionFactory';
 import QuizSubmission from '../components/QuizSubmission';
+import TimerDisplay from '../components/TimerDisplay';
+import TimerManagerService from '../services/timerManagerService';
 import { Question } from '../models/Question';
 import ActivityLogger from '../services/activityLogger';
 import RecordingDebugInfo from '../components/RecordingDebugInfo';
@@ -35,8 +37,13 @@ const QuizAttemptPage = () => {
   const [answers, setAnswers] = useState({});
   const [lockedAnswers, setLockedAnswers] = useState({});
   const [currentResponse, setCurrentResponse] = useState('');
-  const [timeRemaining, setTimeRemaining] = useState(null); // Global quiz time
-  const [questionTimeRemaining, setQuestionTimeRemaining] = useState(0); // Per-question time
+  
+  // Timing state
+  const [timingMode, setTimingMode] = useState('total');
+  const [timeRemaining, setTimeRemaining] = useState(null);
+  const [questionTimeRemaining, setQuestionTimeRemaining] = useState(null);
+  const [overallTimeRemaining, setOverallTimeRemaining] = useState(null);
+  
   const [submitting, setSubmitting] = useState(false);
   const [recordingIds, setRecordingIds] = useState(null);
   const [recordingRequirements, setRecordingRequirements] = useState(null);
@@ -44,10 +51,10 @@ const QuizAttemptPage = () => {
   const [autoSaving, setAutoSaving] = useState(false);
   const [activityLogger, setActivityLogger] = useState(null);
   const [refreshAttempted, setRefreshAttempted] = useState(false);
+  const [attemptData, setAttemptData] = useState(null); // Store attempt data for timer calculations
 
-  // Refs to manage timers
-  const globalTimerRef = useRef(null);
-  const questionTimerRef = useRef(null);
+  // Timer manager reference
+  const timerManagerRef = useRef(null);
 
   // Get recording IDs and resume status from location state
   useEffect(() => {
@@ -118,6 +125,7 @@ useEffect(() => {
       const quizResponse = await axios.get(`/api/quizzes/${quizId}`);
       const quizData = quizResponse.data.data;
       setQuiz(quizData);
+      setTimingMode(quizData.timingMode || 'total');
 
       const recordingResponse = await axios.get(`/api/quizzes/${quizId}/recording-requirements`);
       setRecordingRequirements(recordingResponse.data.data.recordingRequirements);
@@ -134,17 +142,63 @@ useEffect(() => {
       // Always check for existing attempt
       try {
         const attemptResponse = await axios.get(`/api/attempts/${attemptId}`);
-        const attemptData = attemptResponse.data.data;
+        const responseData = attemptResponse.data.data;
+        
+        // Handle the response structure properly
+        const currentAttemptData = responseData.attempt || responseData;
+        const timingData = responseData.timing || {};
+        
+        setAttemptData(currentAttemptData); // Store for timer calculations
+        
+        console.log(`[Quiz] Resume attempt data:`, {
+          attemptId: currentAttemptData._id,
+          status: currentAttemptData.status,
+          answersCount: currentAttemptData.answers?.length || 0,
+          timingMode: quizData.timingMode,
+          remainingTime: timingData.remainingTime || currentAttemptData.remainingTime,
+          startTime: currentAttemptData.startTime
+        });
 
-        // ✅ SET REMAINING TIME FROM SERVER
-        setTimeRemaining(attemptData.remainingTime);
-
-        // Restore and LOCK answers
-        if (attemptData?.answers && attemptData.answers.length > 0) {
+        // Set timing information based on timing mode
+        if (quizData.timingMode === 'total') {
+          // Use timing data from API response first, fallback to attempt data
+          const remainingTime = timingData.remainingTime ?? currentAttemptData.remainingTime;
+          console.log(`[Quiz] Setting total mode remainingTime: ${remainingTime}`);
+          
+          // Validate the remaining time
+          if (typeof remainingTime === 'number' && remainingTime >= 0 && !isNaN(remainingTime)) {
+            setTimeRemaining(remainingTime);
+            console.log(`[Quiz] ✅ Using API provided remainingTime: ${remainingTime}s`);
+          } else {
+            // Fallback calculation if remainingTime is invalid
+            const timeElapsed = (Date.now() - new Date(currentAttemptData.startTime).getTime()) / 1000;
+            const totalTime = quizData.duration * 60;
+            const calculatedRemaining = Math.max(0, totalTime - timeElapsed);
+            console.log(`[Quiz] ⚠️ Invalid remainingTime, calculated: ${calculatedRemaining}s`);
+            setTimeRemaining(calculatedRemaining);
+          }
+        } else if (quizData.timingMode === 'per-question') {
+          // Use timing data from API response first
+          const overallRemaining = timingData.remainingTime ?? (
+            () => {
+              // Fallback calculation
+              const totalQuestionTime = quizData.questions?.reduce((total, q) => total + (q.timeLimit || 60), 0) || 0;
+              const elapsedTime = (Date.now() - new Date(currentAttemptData.startTime).getTime()) / 1000;
+              return Math.max(0, totalQuestionTime - elapsedTime);
+            }
+          )();
+          
+          console.log(`[Quiz] Setting per-question mode overallTimeRemaining: ${overallRemaining}s`);
+          setOverallTimeRemaining(overallRemaining);
+        }
+          
+        // Restore and LOCK answers, or handle fresh start
+        if (currentAttemptData?.answers && currentAttemptData.answers.length > 0) {
+          console.log(`[Quiz] 🔄 Restoring ${currentAttemptData.answers.length} existing answers`);
           const restoredAnswers = {};
           const locked = {};
 
-          attemptData.answers.forEach(answer => {
+          currentAttemptData.answers.forEach(answer => {
             if (answer.selectedOptions && answer.selectedOptions.length > 0) {
               restoredAnswers[answer.questionId] = answer.selectedOptions.length === 1
                 ? answer.selectedOptions[0]
@@ -166,36 +220,135 @@ useEffect(() => {
             }
           });
 
+          // For per-question timing mode, calculate remaining time for current question
+          if (quizData.timingMode === 'per-question') {
+            // Find which question we're on (first unlocked question)
+            const currentQuestionIndex = questionInstances.findIndex(q => {
+              const qId = q.id || q._id;
+              return !locked[qId];
+            });
+            
+            if (currentQuestionIndex >= 0 && currentQuestionIndex < questionInstances.length) {
+              const currentQuestion = questionInstances[currentQuestionIndex];
+              const questionTimeLimit = currentQuestion.timeLimit || 60;
+              
+              // Calculate how much time has been used in previous questions
+              let timeUsedInPreviousQuestions = 0;
+              for (let i = 0; i < currentQuestionIndex; i++) {
+                const prevQuestion = questionInstances[i];
+                timeUsedInPreviousQuestions += (prevQuestion.timeLimit || 60);
+              }
+              
+              // Calculate remaining time for current question
+              const totalElapsedTime = (Date.now() - new Date(currentAttemptData.startTime).getTime()) / 1000;
+              const timeUsedInCurrentQuestion = Math.max(0, totalElapsedTime - timeUsedInPreviousQuestions);
+              const questionTimeRemaining = Math.max(0, questionTimeLimit - timeUsedInCurrentQuestion);
+              
+              console.log(`[Quiz] Current question ${currentQuestionIndex} - limit: ${questionTimeLimit}s, used: ${timeUsedInCurrentQuestion}s, remaining: ${questionTimeRemaining}s`);
+              setQuestionTimeRemaining(questionTimeRemaining);
+            } else {
+              // Fallback for the first question
+              const firstQuestion = questionInstances[0];
+              if (firstQuestion) {
+                const timeLimit = firstQuestion.timeLimit || 60;
+                console.log(`[Quiz] Setting initial question time: ${timeLimit} seconds`);
+                setQuestionTimeRemaining(timeLimit);
+              }
+            }
+          }
+
           // ➤ Jump to first UNLOCKED question
           const firstUnansweredIndex = questionInstances.findIndex(q => {
             const qId = q.id || q._id;
             return !locked[qId];
           });
+          
+          console.log(`[Quiz] Question navigation analysis:`, {
+            totalQuestions: questionInstances.length,
+            answeredQuestions: Object.keys(locked).length,
+            lockedQuestionIds: Object.keys(locked),
+            firstUnansweredIndex: firstUnansweredIndex
+          });
 
-          const newIndex = firstUnansweredIndex === -1 ? questionInstances.length - 1 : firstUnansweredIndex;
+          // Determine the correct question index to resume at
+          let newIndex;
+          if (firstUnansweredIndex === -1) {
+            // All questions are answered/locked
+            console.log(`[Quiz] ℹ️ All questions are answered, staying at last question`);
+            newIndex = questionInstances.length - 1;
+          } else {
+            // Found an unanswered question
+            console.log(`[Quiz] ✅ Found first unanswered question at index: ${firstUnansweredIndex}`);
+            newIndex = firstUnansweredIndex;
+          }
+          
+          console.log(`[Quiz] Resuming at question index: ${newIndex} (Question ${newIndex + 1}/${questionInstances.length})`);
           setCurrentQuestionIndex(newIndex);
 
-          // ➤ Set currentResponse for first question if not locked
+          // ➤ Set currentResponse for the target question if not locked
           if (newIndex < questionInstances.length) {
-            const firstQ = questionInstances[newIndex];
-            const firstQId = firstQ.id || firstQ._id;
-            const existingResponse = restoredAnswers[firstQId];
-            setCurrentResponse(existingResponse || '');
-            if (firstQ && existingResponse === undefined) {
-              firstQ.setResponse('');
+            const targetQ = questionInstances[newIndex];
+            const targetQId = targetQ.id || targetQ._id;
+            const existingResponse = restoredAnswers[targetQId];
+            
+            if (!locked[targetQId]) {
+              setCurrentResponse(existingResponse || '');
+              if (targetQ && existingResponse === undefined) {
+                targetQ.setResponse('');
+              }
+            } else {
+              // If somehow the target question is also locked, show its answer but disable editing
+              setCurrentResponse(existingResponse || '');
             }
+          }
+        } else {
+          // Fresh start - no previous answers
+          console.log(`[Quiz] 🎆 Fresh start - no previous answers, starting at question 1`);
+          
+          // Ensure we have questions before setting index
+          if (questionInstances.length > 0) {
+            setCurrentQuestionIndex(0);
+            setCurrentResponse('');
+            
+            // Initialize first question for per-question timing
+            if (quizData.timingMode === 'per-question') {
+              const firstQuestion = questionInstances[0];
+              const timeLimit = firstQuestion.timeLimit || 60;
+              console.log(`[Quiz] Setting initial question time: ${timeLimit} seconds`);
+              setQuestionTimeRemaining(timeLimit);
+            }
+          } else {
+            console.warn(`[Quiz] ⚠️ No questions found in quiz!`);
+            setError('Quiz has no questions available.');
+            return;
           }
         }
 
         // ✅ ✅ ✅ MOVE setIsResume HERE — inside try block, after setting time
-        if (attemptData.status === 'in-progress') {
+        if (currentAttemptData.status === 'in-progress') {
           setIsResume(true);
         }
 
       } catch (attemptErr) {
         console.error('No existing attempt found or error fetching attempt:', attemptErr);
-        // ✅ Only set full duration if NO existing attempt
-        setTimeRemaining(quizData.duration * 60);
+        // Set initial time based on timing mode
+        if (quizData.timingMode === 'total') {
+          const initialTime = quizData.duration * 60;
+          console.log(`[Quiz] Setting initial total time: ${initialTime} seconds`);
+          setTimeRemaining(initialTime);
+        } else if (quizData.timingMode === 'per-question') {
+          const totalQuestionTime = quizData.questions?.reduce((total, q) => total + (q.timeLimit || 60), 0) || 0;
+          console.log(`[Quiz] Setting initial per-question total time: ${totalQuestionTime} seconds`);
+          setOverallTimeRemaining(totalQuestionTime);
+          
+          // Set initial question time remaining
+          const firstQuestion = questionInstances[0];
+          if (firstQuestion) {
+            const timeLimit = firstQuestion.timeLimit || 60;
+            console.log(`[Quiz] Setting initial question time: ${timeLimit} seconds`);
+            setQuestionTimeRemaining(timeLimit);
+          }
+        }
       }
 
       setLoading(false);
@@ -208,42 +361,192 @@ useEffect(() => {
   fetchQuizData();
 }, [quizId, attemptId]); // ✅ Dependencies correct
 
-  // Calculate and start per-question timer when currentQuestionIndex changes
-// Calculate and start per-question timer when currentQuestionIndex changes
-useEffect(() => {
-  if (!questions.length || !timeRemaining) return;
-
-  // Clear previous question timer
-  if (questionTimerRef.current) {
-    clearInterval(questionTimerRef.current);
-  }
-
-  const totalQuestions = questions.length;
-  const perQuestionTime = Math.floor(timeRemaining / totalQuestions);
-
-  setQuestionTimeRemaining(perQuestionTime);
-
-  // DEBUG: Log timer start
-  console.log(`[Timer] Starting Q${currentQuestionIndex + 1} with ${perQuestionTime}s (global: ${timeRemaining}s)`);
-
-  // Start per-question countdown
-  questionTimerRef.current = setInterval(() => {
-    setQuestionTimeRemaining(prev => {
-      if (prev <= 1) {
-        clearInterval(questionTimerRef.current);
-        handleQuestionTimeout();
-        return 0;
-      }
-      return prev - 1;
-    });
-  }, 1000);
-
-  return () => {
-    if (questionTimerRef.current) {
-      clearInterval(questionTimerRef.current);
+  // Initialize timer manager and start appropriate timer
+  useEffect(() => {
+    if (!quiz || !questions.length || submitting) return;
+    
+    // Clean up existing timer manager
+    if (timerManagerRef.current) {
+      timerManagerRef.current.destroy();
     }
-  };
-}, [currentQuestionIndex, questions.length]); // ✅ timeRemaining REMOVED from dependencies
+    
+    console.log(`[Quiz] Initializing timer manager for ${timingMode} mode`);
+    console.log(`[Quiz] timeRemaining: ${timeRemaining}, questionTimeRemaining: ${questionTimeRemaining}`);
+    
+    // Create new timer manager with callbacks
+    const timerCallbacks = {
+      onTimeUpdate: (type, remaining, questionIndex) => {
+        console.log(`[Timer] Update: ${type}, remaining: ${remaining}s`);
+        if (type === 'total') {
+          setTimeRemaining(remaining);
+        } else if (type === 'question') {
+          setQuestionTimeRemaining(remaining);
+          // Also update overall time remaining for per-question mode
+          if (timingMode === 'per-question') {
+            const currentQuestion = questions[questionIndex];
+            if (currentQuestion) {
+              // Calculate how much time has passed in total
+              const totalQuestionTime = questions.reduce((total, q) => total + (q.timeLimit || 60), 0);
+              const questionsPassed = questionIndex;
+              const timeUsedInPreviousQuestions = questions.slice(0, questionsPassed).reduce((total, q) => total + (q.timeLimit || 60), 0);
+              const timeUsedInCurrentQuestion = (currentQuestion.timeLimit || 60) - remaining;
+              const totalTimeUsed = timeUsedInPreviousQuestions + timeUsedInCurrentQuestion;
+              const overallRemaining = Math.max(0, totalQuestionTime - totalTimeUsed);
+              setOverallTimeRemaining(overallRemaining);
+            }
+          }
+        }
+      },
+      
+      onTimeExpired: (type) => {
+        console.log(`[Timer] ${type} timer expired`);
+        handleTimeExpiration();
+      },
+      
+      onQuestionTimeout: (questionIndex) => {
+        console.log(`[Timer] Question ${questionIndex + 1} timed out`);
+        handleQuestionTimeout();
+      },
+      
+      onWarning: (type, remaining) => {
+        console.log(`[Timer] Warning: ${type} timer has ${remaining}s remaining`);
+        if (activityLogger) {
+          activityLogger.logActivity('TIME_WARNING', `${type} timer warning: ${remaining}s remaining`);
+        }
+      },
+      
+      onCritical: (type, remaining) => {
+        console.log(`[Timer] Critical: ${type} timer has ${remaining}s remaining`);
+        if (activityLogger) {
+          activityLogger.logActivity('TIME_CRITICAL', `${type} timer critical: ${remaining}s remaining`);
+        }
+      }
+    };
+    
+    timerManagerRef.current = new TimerManagerService(
+      timingMode,
+      quiz,
+      { startTime: new Date() }, // attempt info
+      timerCallbacks
+    );
+    
+    console.log(`[Quiz] Timer manager initialized for ${timingMode} mode`);
+    
+    return () => {
+      if (timerManagerRef.current) {
+        timerManagerRef.current.destroy();
+      }
+    };
+  }, [quiz, questions, timingMode, submitting]); // Keep dependencies minimal
+  
+  // Handle timer start for TOTAL mode - with improved logic
+  useEffect(() => {
+    if (timingMode === 'total' && timerManagerRef.current && !submitting) {
+      console.log(`[Timer] Checking total timer start conditions:`);
+      console.log(`[Timer] - timeRemaining: ${timeRemaining}`);
+      console.log(`[Timer] - timeRemaining type: ${typeof timeRemaining}`);
+      console.log(`[Timer] - isRunning: ${timerManagerRef.current.getState().isRunning}`);
+      
+      // Enhanced validation with better error handling
+      const isValidTimeRemaining = (
+        timeRemaining !== null && 
+        timeRemaining !== undefined && 
+        typeof timeRemaining === 'number' && 
+        !isNaN(timeRemaining) && 
+        timeRemaining >= 0
+      );
+      
+      if (isValidTimeRemaining) {
+        const timerState = timerManagerRef.current.getState();
+        if (!timerState.isRunning) {
+          console.log(`[Timer] ✅ STARTING total timer with ${timeRemaining} seconds`);
+          try {
+            timerManagerRef.current.start(timeRemaining);
+            console.log(`[Timer] ✅ Total timer started successfully`);
+          } catch (error) {
+            console.error(`[Timer] ❌ Error starting total timer:`, error);
+            // Reset timeRemaining to quiz duration as fallback
+            if (quiz?.duration) {
+              const fallbackTime = quiz.duration * 60;
+              console.log(`[Timer] 🔄 Falling back to quiz duration: ${fallbackTime} seconds`);
+              setTimeRemaining(fallbackTime);
+            }
+          }
+        } else {
+          console.log(`[Timer] ℹ️ Total timer already running`);
+        }
+      } else {
+        console.log(`[Timer] ❌ Cannot start total timer - invalid timeRemaining: ${timeRemaining}`);
+        // If we have quiz data but invalid timeRemaining, reset it
+        if (quiz?.duration && timeRemaining !== quiz.duration * 60) {
+          const correctTime = quiz.duration * 60;
+          console.log(`[Timer] 🔄 Resetting timeRemaining to correct value: ${correctTime} seconds`);
+          setTimeRemaining(correctTime);
+        }
+      }
+    }
+  }, [timeRemaining, timingMode, submitting, quiz]);
+  
+  // Handle timer start for PER-QUESTION mode
+  useEffect(() => {
+    if (timingMode === 'per-question' && timerManagerRef.current && questions.length > 0 && !submitting) {
+      console.log(`[Timer] Starting per-question timer for question ${currentQuestionIndex}`);
+      
+      const currentQuestion = questions[currentQuestionIndex];
+      if (currentQuestion) {
+        // Ensure question has a valid time limit
+        const timeLimit = currentQuestion.timeLimit || 60; // Default to 60 seconds
+        console.log(`[Timer] Question ${currentQuestionIndex} time limit: ${timeLimit} seconds`);
+        
+        // Use questionTimeRemaining if available, otherwise use full time limit
+        const remainingTime = (typeof questionTimeRemaining === 'number' && questionTimeRemaining >= 0) ? questionTimeRemaining : timeLimit;
+        console.log(`[Timer] Using remaining time: ${remainingTime} seconds`);
+        
+        // Validate and set question time remaining
+        if (typeof remainingTime === 'number' && remainingTime >= 0) {
+          setQuestionTimeRemaining(remainingTime);
+          
+          const timerState = timerManagerRef.current.getState();
+          if (!timerState.isRunning) {
+            console.log(`[Timer] ✅ STARTING per-question timer with ${remainingTime} seconds`);
+            try {
+              timerManagerRef.current.start(0, currentQuestionIndex, remainingTime);
+              console.log(`[Timer] ✅ Per-question timer started successfully`);
+            } catch (error) {
+              console.error(`[Timer] ❌ Error starting per-question timer:`, error);
+              // Fallback to default time
+              setQuestionTimeRemaining(timeLimit);
+            }
+          }
+        } else {
+          console.warn(`[Timer] Invalid remaining time for question ${currentQuestionIndex}: ${remainingTime}`);
+          setQuestionTimeRemaining(timeLimit); // Default fallback
+        }
+      }
+    }
+  }, [timingMode, currentQuestionIndex, questions, submitting, questionTimeRemaining]);
+  
+  // Handle question navigation for per-question mode
+  useEffect(() => {
+    if (timingMode === 'per-question' && timerManagerRef.current && !submitting) {
+      // Calculate remaining time for the new question
+      const currentQuestion = questions[currentQuestionIndex];
+      if (currentQuestion) {
+        const timeLimit = currentQuestion.timeLimit || 60;
+        
+        // If we have a specific questionTimeRemaining set, use it; otherwise use full time limit
+        const remainingTime = (typeof questionTimeRemaining === 'number' && questionTimeRemaining >= 0) ? questionTimeRemaining : timeLimit;
+        
+        // Switch to the current question's timer with the correct remaining time
+        timerManagerRef.current.switchToQuestion(currentQuestionIndex, remainingTime);
+        
+        // Update state
+        setQuestionTimeRemaining(remainingTime);
+        
+        console.log(`[Timer] Switched to question ${currentQuestionIndex} with ${remainingTime}s remaining`);
+      }
+    }
+  }, [currentQuestionIndex, timingMode, submitting, questionTimeRemaining]);
 
   // Handle per-question timeout
   const handleQuestionTimeout = () => {
@@ -295,6 +598,12 @@ useEffect(() => {
       setCurrentResponse(existingAnswer || '');
       if (nextQ && existingAnswer === undefined) {
         nextQ.setResponse('');
+      }
+      
+      // Set question time remaining for per-question mode
+      if (timingMode === 'per-question' && nextQ && nextQ.timeLimit) {
+        // For timeout navigation, start fresh with full time limit
+        setQuestionTimeRemaining(nextQ.timeLimit);
       }
     }
   };
@@ -355,32 +664,6 @@ useEffect(() => {
     }
   };
 
-  // Global quiz timer countdown
-  useEffect(() => {
-    if (!timeRemaining || timeRemaining <= 0) return;
-
-    if (globalTimerRef.current) {
-      clearInterval(globalTimerRef.current);
-    }
-
-    globalTimerRef.current = setInterval(() => {
-      setTimeRemaining(prev => {
-        if (prev <= 1) {
-          clearInterval(globalTimerRef.current);
-          handleTimeExpiration();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => {
-      if (globalTimerRef.current) {
-        clearInterval(globalTimerRef.current);
-      }
-    };
-  }, [timeRemaining, navigate, answers, questions, quizId, attemptId]);
-
   // Handle forced refresh
   const handleForcedRefresh = async () => {
     try {
@@ -437,52 +720,102 @@ useEffect(() => {
     }
   };
 
-  // Visibility change listener
+  // Enhanced visibility change listener with better refresh detection
   useEffect(() => {
+    let refreshDetected = false;
+    
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden' && !submitting) {
+        // User switched tabs or minimized browser
         if (activityLogger) {
           activityLogger.logActivity('TAB_HIDDEN', 'User switched tabs or minimized browser');
         }
-      } else if (document.visibilityState === 'visible' && refreshAttempted) {
-        handleForcedRefresh();
+        
+        // Set a flag to detect if this was a refresh attempt
+        refreshDetected = true;
+        setTimeout(() => {
+          refreshDetected = false; // Reset after 2 seconds
+        }, 2000);
+      } else if (document.visibilityState === 'visible' && refreshDetected && !submitting) {
+        // Page became visible again after being hidden - likely a refresh attempt
+        console.log('[Quiz] Potential refresh detected via visibility change');
+        if (activityLogger) {
+          activityLogger.logActivity('REFRESH_ATTEMPT', 'Page refresh attempt detected via visibility change');
+        }
+        setRefreshAttempted(true);
+        // Give user a chance to see the warning, then handle refresh
+        setTimeout(() => {
+          if (!submitting) {
+            handleForcedRefresh();
+          }
+        }, 1000);
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [refreshAttempted, submitting]);
+  }, [submitting, activityLogger]);
 
-  // Beforeunload handler
+  // Enhanced beforeunload handler with improved refresh detection
   useEffect(() => {
     const handleBeforeUnload = (e) => {
       if (!submitting) {
+        console.log('[Quiz] Before unload event triggered - potential refresh or navigation');
+        if (activityLogger) {
+          activityLogger.logActivity('BEFORE_UNLOAD', 'User attempted to leave or refresh page');
+        }
+        
         setRefreshAttempted(true);
+        
+        // For modern browsers, setting returnValue triggers the confirmation dialog
+        const message = 'Your quiz progress will be submitted if you leave this page. Are you sure?';
         e.preventDefault();
-        e.returnValue = 'Your answers are final once submitted. Leaving may auto-submit your quiz.';
-        return 'Your answers are final once submitted. Leaving may auto-submit your quiz.';
+        e.returnValue = message;
+        return message;
+      }
+    };
+
+    const handleUnload = () => {
+      if (!submitting) {
+        console.log('[Quiz] Page unload detected - saving state');
+        // Try to save current state before page unloads
+        if (answers && Object.keys(answers).length > 0) {
+          // Use sendBeacon for more reliable delivery
+          navigator.sendBeacon && navigator.sendBeacon(
+            `/api/attempts/save/${attemptId}`,
+            JSON.stringify({ answers: Object.keys(answers).map(questionId => {
+              const answer = answers[questionId];
+              if (Array.isArray(answer)) {
+                return { questionId, selectedOptions: answer, textAnswer: '' };
+              } else if (typeof answer === 'string') {
+                return { questionId, selectedOptions: [], textAnswer: answer };
+              }
+              return { questionId, selectedOptions: [], textAnswer: '' };
+            })})
+          );
+        }
       }
     };
 
     window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [submitting]);
-
-  // Format time remaining (global)
+    window.addEventListener('unload', handleUnload);
+    
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('unload', handleUnload);
+    };
+  }, [submitting, answers, attemptId, activityLogger]);
   const formatTimeRemaining = () => {
-    if (!timeRemaining) return '00:00:00';
-    const hours = Math.floor(timeRemaining / 3600);
-    const minutes = Math.floor((timeRemaining % 3600) / 60);
-    const seconds = Math.floor(timeRemaining % 60);
-    return [hours, minutes, seconds].map(v => v.toString().padStart(2, '0')).join(':');
+    if (timingMode === 'total') {
+      return TimerManagerService.formatTime(timeRemaining || 0, true);
+    } else {
+      return TimerManagerService.formatTime(overallTimeRemaining || 0, true);
+    }
   };
 
   // Format per-question time
   const formatQuestionTimeRemaining = () => {
-    if (!questionTimeRemaining) return '00:00';
-    const minutes = Math.floor(questionTimeRemaining / 60);
-    const seconds = Math.floor(questionTimeRemaining % 60);
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    return TimerManagerService.formatTime(questionTimeRemaining || 0, false);
   };
 
   // Auto-save functionality (only called manually after locking)
@@ -552,16 +885,18 @@ useEffect(() => {
       });
     }
 
-    // ➡️ Now find next UNLOCKED question
+    // ➡️ Now find next UNLOCKED question, skipping any locked ones
     let nextIndex = currentQuestionIndex + 1;
     while (nextIndex < questions.length) {
       const nextQ = questions[nextIndex];
       const nextQId = nextQ.id || nextQ._id;
-      if (!lockedAnswers[nextQId]) break;
+      if (!lockedAnswers[nextQId]) break; // Found an unlocked question
       nextIndex++;
     }
 
     if (nextIndex < questions.length) {
+      console.log(`[Navigation] Moving from question ${currentQuestionIndex + 1} to ${nextIndex + 1} (skipped ${nextIndex - currentQuestionIndex - 1} locked questions)`);
+      
       if (activityLogger) {
         activityLogger.logNavigation(currentQuestionIndex + 1, nextIndex + 1, 'next');
       }
@@ -574,6 +909,32 @@ useEffect(() => {
       if (nextQ && existingAnswer === undefined) {
         nextQ.setResponse('');
       }
+      
+      // Set question time remaining for per-question mode
+      if (timingMode === 'per-question' && nextQ) {
+        // Calculate remaining time for the next question
+        const timeLimit = nextQ.timeLimit || 60;
+        
+        // Calculate how much total time has elapsed since quiz start
+        const totalElapsedTime = (Date.now() - new Date(attemptData?.startTime || Date.now()).getTime()) / 1000;
+        
+        // Calculate time used in previous questions (including current one)
+        let timeUsedInPreviousQuestions = 0;
+        for (let i = 0; i <= currentQuestionIndex; i++) {
+          const prevQ = questions[i];
+          timeUsedInPreviousQuestions += (prevQ?.timeLimit || 60);
+        }
+        
+        // Calculate time used in next question (should be 0 for a fresh question)
+        const timeUsedInNextQuestion = Math.max(0, totalElapsedTime - timeUsedInPreviousQuestions);
+        const nextQuestionTimeRemaining = Math.max(0, timeLimit - timeUsedInNextQuestion);
+        
+        setQuestionTimeRemaining(nextQuestionTimeRemaining);
+        console.log(`[Navigation] Next question ${nextIndex} - limit: ${timeLimit}s, remaining: ${nextQuestionTimeRemaining}s`);
+      }
+    } else {
+      console.log('[Navigation] No more unlocked questions available - reached end');
+      // All remaining questions are locked, user is at the end
     }
   };
 
@@ -664,19 +1025,19 @@ useEffect(() => {
             </Typography>
 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-              <Typography variant="body2" color="text.secondary">
-                Quiz Time:
-              </Typography>
-              <Typography variant="h6" sx={{ fontFamily: 'monospace' }}>
-                {formatTimeRemaining()}
-              </Typography>
-
-              <Typography variant="body2" color="text.secondary">
-                Question Time:
-              </Typography>
-              <Typography variant="h6" sx={{ fontFamily: 'monospace', color: questionTimeRemaining <= 10 ? 'error.main' : 'inherit' }}>
-                {formatQuestionTimeRemaining()}
-              </Typography>
+              <TimerDisplay
+                timingMode={timingMode}
+                // Total mode props
+                totalTime={quiz?.duration ? quiz.duration * 60 : 0}
+                remainingTime={timeRemaining}
+                // Per-question mode props
+                questionTimeLimit={questions[currentQuestionIndex]?.timeLimit || 60}
+                questionTimeRemaining={questionTimeRemaining}
+                currentQuestionIndex={currentQuestionIndex}
+                totalQuestions={questions.length}
+                overallTimeRemaining={overallTimeRemaining}
+                overallTotalTime={quiz?.questions ? quiz.questions.reduce((total, q) => total + (q.timeLimit || 60), 0) : 0}
+              />
 
               {recordingIds && (
                 <>
