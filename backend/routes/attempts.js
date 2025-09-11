@@ -488,6 +488,87 @@ router.get('/pending-review', authorize('admin'), resultVisibilityController.get
 // @access  Private (Admin can access any attempt, users can only access their own)
 router.get('/:id', attemptController.getAttemptDetails);
 
+// @route   PUT /api/attempts/:id/question-timing
+// @desc    Update question timing data for per-question mode
+// @access  Private
+router.put('/:id/question-timing', async (req, res, next) => {
+  try {
+    const { questionId, timeRemaining } = req.body;
+    
+    if (!questionId || typeof timeRemaining !== 'number' || timeRemaining < 0) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'INVALID_REQUEST',
+        message: 'Valid questionId and timeRemaining (>= 0) are required'
+      });
+    }
+    
+    // Find attempt - Allow admin to access any attempt
+    let query = {
+      _id: req.params.id,
+      status: 'in-progress'
+    };
+    
+    // If not admin, restrict to user's own attempts
+    if (req.user.role !== 'admin') {
+      query.userId = req.user._id;
+    }
+    
+    const attempt = await Attempt.findOne(query);
+    
+    if (!attempt) {
+      return res.status(404).json({
+        status: 'error',
+        code: 'ATTEMPT_NOT_FOUND',
+        message: 'Attempt not found or not in progress'
+      });
+    }
+    
+    // Only update timing for per-question mode
+    if (attempt.timingMode !== 'per-question') {
+      return res.status(400).json({
+        status: 'error',
+        code: 'INVALID_TIMING_MODE',
+        message: 'Question timing can only be updated for per-question mode'
+      });
+    }
+    
+    // Initialize maps if they don't exist
+    if (!attempt.questionTimeRemaining) {
+      attempt.questionTimeRemaining = new Map();
+    }
+    if (!attempt.questionStartTimes) {
+      attempt.questionStartTimes = new Map();
+    }
+    
+    const questionIdStr = questionId.toString();
+    
+    // Update the remaining time for this question
+    attempt.questionTimeRemaining.set(questionIdStr, Math.max(0, timeRemaining));
+    
+    // If this is the first time tracking this question, set start time
+    if (!attempt.questionStartTimes.has(questionIdStr)) {
+      attempt.questionStartTimes.set(questionIdStr, new Date());
+    }
+    
+    await attempt.save();
+    
+    console.log(`[Backend] Updated question ${questionId} timing: ${timeRemaining}s remaining`);
+    
+    res.status(200).json({
+      status: 'success',
+      data: {
+        questionId,
+        timeRemaining: Math.max(0, timeRemaining),
+        message: 'Question timing updated successfully'
+      }
+    });
+  } catch (err) {
+    console.error('Error updating question timing:', err);
+    next(err);
+  }
+});
+
 // @route   POST /api/attempts/validate/:quizId/:attemptId
 // @desc    Validate quiz answers before submission
 // @access  Private

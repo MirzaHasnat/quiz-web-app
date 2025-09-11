@@ -222,6 +222,9 @@ useEffect(() => {
 
           // For per-question timing mode, calculate remaining time for current question
           if (quizData.timingMode === 'per-question') {
+            // Use timing data from API response to get per-question timing
+            let questionTimeRemaining = null;
+            
             // Find which question we're on (first unlocked question)
             const currentQuestionIndex = questionInstances.findIndex(q => {
               const qId = q.id || q._id;
@@ -230,21 +233,38 @@ useEffect(() => {
             
             if (currentQuestionIndex >= 0 && currentQuestionIndex < questionInstances.length) {
               const currentQuestion = questionInstances[currentQuestionIndex];
+              const questionId = currentQuestion.id || currentQuestion._id;
               const questionTimeLimit = currentQuestion.timeLimit || 60;
               
-              // Calculate how much time has been used in previous questions
-              let timeUsedInPreviousQuestions = 0;
-              for (let i = 0; i < currentQuestionIndex; i++) {
-                const prevQuestion = questionInstances[i];
-                timeUsedInPreviousQuestions += (prevQuestion.timeLimit || 60);
+              // Check if we have stored timing data for this question
+              if (timingData.questionTimeRemaining && timingData.questionTimeRemaining[questionId]) {
+                // Use stored remaining time
+                questionTimeRemaining = timingData.questionTimeRemaining[questionId];
+                console.log(`[Quiz] Using stored remaining time for question ${currentQuestionIndex}: ${questionTimeRemaining}s`);
+              } else if (timingData.questionTimeLimits) {
+                // Look for this question in the timing limits data
+                const questionTiming = timingData.questionTimeLimits.find(qt => qt.questionId.toString() === questionId.toString());
+                if (questionTiming) {
+                  questionTimeRemaining = questionTiming.timeRemaining;
+                  console.log(`[Quiz] Using calculated remaining time for question ${currentQuestionIndex}: ${questionTimeRemaining}s`);
+                }
               }
               
-              // Calculate remaining time for current question
-              const totalElapsedTime = (Date.now() - new Date(currentAttemptData.startTime).getTime()) / 1000;
-              const timeUsedInCurrentQuestion = Math.max(0, totalElapsedTime - timeUsedInPreviousQuestions);
-              const questionTimeRemaining = Math.max(0, questionTimeLimit - timeUsedInCurrentQuestion);
+              // Fallback calculation if no stored data available
+              if (questionTimeRemaining === null || questionTimeRemaining === undefined) {
+                // Calculate based on overall elapsed time (fallback only)
+                let timeUsedInPreviousQuestions = 0;
+                for (let i = 0; i < currentQuestionIndex; i++) {
+                  const prevQuestion = questionInstances[i];
+                  timeUsedInPreviousQuestions += (prevQuestion.timeLimit || 60);
+                }
+                
+                const totalElapsedTime = (Date.now() - new Date(currentAttemptData.startTime).getTime()) / 1000;
+                const timeUsedInCurrentQuestion = Math.max(0, totalElapsedTime - timeUsedInPreviousQuestions);
+                questionTimeRemaining = Math.max(0, questionTimeLimit - timeUsedInCurrentQuestion);
+                console.log(`[Quiz] Fallback calculation for question ${currentQuestionIndex}: ${questionTimeRemaining}s`);
+              }
               
-              console.log(`[Quiz] Current question ${currentQuestionIndex} - limit: ${questionTimeLimit}s, used: ${timeUsedInCurrentQuestion}s, remaining: ${questionTimeRemaining}s`);
               setQuestionTimeRemaining(questionTimeRemaining);
             } else {
               // Fallback for the first question
@@ -381,6 +401,20 @@ useEffect(() => {
           setTimeRemaining(remaining);
         } else if (type === 'question') {
           setQuestionTimeRemaining(remaining);
+          
+          // Save timing data for per-question mode
+          if (timingMode === 'per-question' && questions[questionIndex]) {
+            const currentQ = questions[questionIndex];
+            const currentQId = currentQ?.id || currentQ?._id;
+            if (currentQId) {
+              // Debounce saves to avoid too frequent API calls
+              clearTimeout(window.questionTimingSaveTimeout);
+              window.questionTimingSaveTimeout = setTimeout(() => {
+                saveQuestionTiming(currentQId, remaining);
+              }, 1000);
+            }
+          }
+          
           // Also update overall time remaining for per-question mode
           if (timingMode === 'per-question') {
             const currentQuestion = questions[questionIndex];
@@ -547,6 +581,23 @@ useEffect(() => {
       }
     }
   }, [currentQuestionIndex, timingMode, submitting, questionTimeRemaining]);
+  
+  // Periodically save question timing for per-question mode
+  useEffect(() => {
+    if (timingMode !== 'per-question' || submitting || !questions.length) return;
+    
+    const interval = setInterval(() => {
+      const currentQ = questions[currentQuestionIndex];
+      const currentQId = currentQ?.id || currentQ?._id;
+      
+      if (currentQId && typeof questionTimeRemaining === 'number' && questionTimeRemaining > 0) {
+        // Save timing data every 5 seconds to maintain persistence
+        saveQuestionTiming(currentQId, questionTimeRemaining);
+      }
+    }, 5000); // Save every 5 seconds
+    
+    return () => clearInterval(interval);
+  }, [timingMode, submitting, questions, currentQuestionIndex, questionTimeRemaining]);
 
   // Handle per-question timeout
   const handleQuestionTimeout = () => {
@@ -846,6 +897,21 @@ useEffect(() => {
       setAutoSaving(false);
     }
   };
+  
+  // Save question timing data for per-question mode
+  const saveQuestionTiming = async (questionId, timeRemaining) => {
+    if (timingMode !== 'per-question' || !attemptId) return;
+    
+    try {
+      await axios.put(`/api/attempts/${attemptId}/question-timing`, {
+        questionId: questionId.toString(),
+        timeRemaining: Math.max(0, Math.floor(timeRemaining))
+      });
+      console.log(`[Frontend] Saved question ${questionId} timing: ${timeRemaining}s`);
+    } catch (err) {
+      console.error('Failed to save question timing:', err);
+    }
+  };
 
   // Handle response change — store in local state, NOT locked yet
   const handleResponseChange = (questionId, response) => {
@@ -861,11 +927,16 @@ useEffect(() => {
   };
 
   // Handle “Next” — lock, save, advance
-  const handleNextQuestion = () => {
+  const handleNextQuestion = async () => {
     const currentQ = questions[currentQuestionIndex];
     const currentQId = currentQ?.id || currentQ?._id;
 
     if (!currentQId) return;
+
+    // Save current question timing data for per-question mode BEFORE moving
+    if (timingMode === 'per-question' && typeof questionTimeRemaining === 'number') {
+      await saveQuestionTiming(currentQId, questionTimeRemaining);
+    }
 
     // If not locked yet, lock and save it
     if (!lockedAnswers[currentQId]) {
@@ -912,22 +983,21 @@ useEffect(() => {
       
       // Set question time remaining for per-question mode
       if (timingMode === 'per-question' && nextQ) {
-        // Calculate remaining time for the next question
+        const nextQId = nextQ.id || nextQ._id;
         const timeLimit = nextQ.timeLimit || 60;
         
-        // Calculate how much total time has elapsed since quiz start
-        const totalElapsedTime = (Date.now() - new Date(attemptData?.startTime || Date.now()).getTime()) / 1000;
+        // First, try to get the remaining time from the stored timing data
+        let nextQuestionTimeRemaining = timeLimit; // Default to full time limit
         
-        // Calculate time used in previous questions (including current one)
-        let timeUsedInPreviousQuestions = 0;
-        for (let i = 0; i <= currentQuestionIndex; i++) {
-          const prevQ = questions[i];
-          timeUsedInPreviousQuestions += (prevQ?.timeLimit || 60);
+        // Check if we have timing data from the backend
+        if (attemptData?.timing?.questionTimeRemaining && attemptData.timing.questionTimeRemaining[nextQId]) {
+          nextQuestionTimeRemaining = attemptData.timing.questionTimeRemaining[nextQId];
+          console.log(`[Navigation] Using stored timing for question ${nextIndex}: ${nextQuestionTimeRemaining}s`);
+        } else {
+          // This is likely a fresh question, use full time limit
+          console.log(`[Navigation] Fresh question ${nextIndex}, using full time limit: ${timeLimit}s`);
+          nextQuestionTimeRemaining = timeLimit;
         }
-        
-        // Calculate time used in next question (should be 0 for a fresh question)
-        const timeUsedInNextQuestion = Math.max(0, totalElapsedTime - timeUsedInPreviousQuestions);
-        const nextQuestionTimeRemaining = Math.max(0, timeLimit - timeUsedInNextQuestion);
         
         setQuestionTimeRemaining(nextQuestionTimeRemaining);
         console.log(`[Navigation] Next question ${nextIndex} - limit: ${timeLimit}s, remaining: ${nextQuestionTimeRemaining}s`);

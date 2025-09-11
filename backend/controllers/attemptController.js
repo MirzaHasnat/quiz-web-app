@@ -24,6 +24,54 @@ const calculateRemainingTime = (attempt, quiz) => {
   return 0;
 };
 
+// Helper function to calculate remaining time for a specific question
+const calculateQuestionRemainingTime = (attempt, questionId, questionTimeLimit) => {
+  if (attempt.timingMode !== 'per-question') {
+    return questionTimeLimit || 60;
+  }
+  
+  const questionIdStr = questionId.toString();
+  
+  // Check if we have stored remaining time for this question
+  if (attempt.questionTimeRemaining && attempt.questionTimeRemaining.has(questionIdStr)) {
+    return Math.max(0, attempt.questionTimeRemaining.get(questionIdStr));
+  }
+  
+  // If no stored time, check if question has been started
+  if (attempt.questionStartTimes && attempt.questionStartTimes.has(questionIdStr)) {
+    const startTime = attempt.questionStartTimes.get(questionIdStr);
+    const elapsed = Math.floor((Date.now() - new Date(startTime).getTime()) / 1000);
+    const remaining = Math.max(0, (questionTimeLimit || 60) - elapsed);
+    return remaining;
+  }
+  
+  // Question hasn't been started yet, return full time limit
+  return questionTimeLimit || 60;
+};
+
+// Helper function to update question timing data
+const updateQuestionTiming = async (attempt, questionId, timeRemaining) => {
+  const questionIdStr = questionId.toString();
+  
+  if (!attempt.questionTimeRemaining) {
+    attempt.questionTimeRemaining = new Map();
+  }
+  
+  // Store the remaining time for this question
+  attempt.questionTimeRemaining.set(questionIdStr, Math.max(0, timeRemaining));
+  
+  // If this is the first time tracking this question, set start time
+  if (!attempt.questionStartTimes || !attempt.questionStartTimes.has(questionIdStr)) {
+    if (!attempt.questionStartTimes) {
+      attempt.questionStartTimes = new Map();
+    }
+    attempt.questionStartTimes.set(questionIdStr, new Date());
+  }
+  
+  console.log(`[Backend] Updated question ${questionId} timing: ${timeRemaining}s remaining`);
+  return attempt.save();
+};
+
 // @desc    Get all attempts with filtering and pagination
 // @route   GET /api/attempts
 // @access  Private/Admin
@@ -162,11 +210,28 @@ exports.getAttemptDetails = async (req, res, next) => {
         attempt.quizId.calculateTotalQuestionTime() : 
         attempt.quizId.questions.reduce((total, q) => total + (q.timeLimit || 60), 0);
       
-      // Add question-specific timing info
+      // Add question-specific timing info with remaining times
       timingInfo.questionTimeLimits = attempt.quizId.questions.map(q => ({
         questionId: q._id,
-        timeLimit: q.timeLimit || 60 // default fallback
+        timeLimit: q.timeLimit || 60,
+        timeRemaining: calculateQuestionRemainingTime(attempt, q._id, q.timeLimit || 60)
       }));
+      
+      // Add question timing state maps for frontend use
+      timingInfo.questionStartTimes = {};
+      timingInfo.questionTimeRemaining = {};
+      
+      if (attempt.questionStartTimes) {
+        for (const [questionId, startTime] of attempt.questionStartTimes) {
+          timingInfo.questionStartTimes[questionId] = startTime;
+        }
+      }
+      
+      if (attempt.questionTimeRemaining) {
+        for (const [questionId, timeRemaining] of attempt.questionTimeRemaining) {
+          timingInfo.questionTimeRemaining[questionId] = timeRemaining;
+        }
+      }
     }
 
     // For regular users, check if they can see their score
