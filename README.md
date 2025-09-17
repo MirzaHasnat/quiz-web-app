@@ -56,11 +56,32 @@ npm start
 
 ## Features
 
-- User authentication and authorization
-- Quiz creation and management
-- Real-time quiz attempts with recording
-- Admin dashboard for user and quiz management
-- Automatic result calculation with negative marking support
+### Authentication & User Management
+- User registration and login
+- JWT-based authentication
+- Role-based access control (Admin/User)
+- Password reset functionality
+
+### Quiz Management
+- Create and edit quizzes with multiple question types
+- Single select, multi-select, and free text questions
+- Quiz activation/deactivation controls
+- Flexible timing settings (per quiz and per question)
+- Negative marking support
+
+### Quiz Taking Experience
+- Real-time quiz attempts with auto-save
+- Screen and audio recording during attempts
+- Timer display with automatic submission
+- Question navigation and review
+- Recording validation and error handling
+
+### Results & Analytics
+- Automatic scoring with negative marking
+- Result visibility controls
+- Detailed attempt reviews with recordings
+- Admin dashboard with user and quiz statistics
+- Recording playback for attempt verification
 
 ## API Endpoints
 
