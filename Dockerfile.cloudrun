@@ -17,15 +17,8 @@ COPY frontend/ ./frontend/
 # Build frontend for production
 RUN cd frontend && npm run build
 
-# Move built frontend to backend directory for serving
-RUN mkdir -p /app/backend/build
-RUN cp -r /app/frontend/build/* /app/backend/
-
 # Create uploads directory
 RUN mkdir -p /app/backend/uploads
-
-# Set working directory to backend
-WORKDIR /app/backend
 
 # Set production environment
 ENV NODE_ENV=production
@@ -33,5 +26,5 @@ ENV NODE_ENV=production
 # Expose port (Cloud Run uses PORT env var)
 EXPOSE $PORT
 
-# Start server
-CMD ["node", "server.js"]
+# Start server from /app directory so paths work correctly
+CMD ["node", "backend/server.js"]
