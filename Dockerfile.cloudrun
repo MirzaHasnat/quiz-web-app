@@ -1,0 +1,27 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY backend/package*.json ./backend/
+COPY frontend/package*.json ./frontend/
+
+# Install dependencies
+RUN cd backend && npm ci --only=production
+RUN cd frontend && npm ci
+
+# Copy source code
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
+
+# Build frontend
+RUN cd frontend && npm run build
+
+# Create uploads directory
+RUN mkdir -p /app/backend/uploads
+
+# Expose port (Cloud Run uses PORT env var)
+EXPOSE $PORT
+
+# Start server
+CMD ["node", "backend/server.js"]
